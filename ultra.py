@@ -100,7 +100,7 @@ class SnippingTool(tk.Toplevel):
 class AutoBotGraph(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("AutoBot v1.1 - Updated")
+        self.title("AutoBot v1.6")
         self.geometry("1350x900")
         self.configure(bg=THEME["bg_main"])
 
@@ -122,9 +122,15 @@ class AutoBotGraph(tk.Tk):
         self.temp_line = None
         self.drag_data = {"item": None, "x": 0, "y": 0, "type": None, "source_id": None}
 
+        # 缩放比例
+        self.zoom_scale = 1.0
+
+        # 录制相关变量
         self.mouse_listener = None
         self.key_listener = None
         self.last_action_time = 0
+        self.rec_start_pos = None  # 用于记录拖拽起点
+        self.rec_start_time = 0  # 用于记录拖拽时长
 
         self.setup_styles()
         self.setup_ui()
@@ -134,7 +140,9 @@ class AutoBotGraph(tk.Tk):
         threading.Thread(target=self.hotkey_thread_worker, daemon=True).start()
 
         self.update_mouse_coords()
-        self.focus_set()  # 启动时聚焦主窗口
+
+        # 【优化】启动时强制聚焦，提升初始手感
+        self.after(100, self.focus_force)
 
     def release_focus_global(self, event):
         """点击非输入框区域，强制让输入框失去焦点，激活热键"""
@@ -270,7 +278,7 @@ class AutoBotGraph(tk.Tk):
                                  wraplength=380, justify="left")
         self.lbl_hint.pack(fill="x", pady=(10, 0))
 
-        # === 按钮区域 (修改了这里) ===
+        # === 按钮区域 ===
         f_btns = tk.Frame(f_left, bg=THEME["bg_panel"], padx=15, pady=10)
         f_btns.pack(fill="x", side="top")
 
@@ -280,7 +288,6 @@ class AutoBotGraph(tk.Tk):
         tk.Button(f_btns, text="➕ 新增节点", command=self.add_node_btn, bg="#43a047", **btn_conf) \
             .grid(row=0, column=0, padx=2, pady=5)
 
-        # 【新增】更新节点按钮
         tk.Button(f_btns, text="💾 更新节点", command=self.update_node_btn, bg="#00bcd4", **btn_conf) \
             .grid(row=0, column=1, padx=2, pady=5)
 
@@ -344,10 +351,14 @@ class AutoBotGraph(tk.Tk):
             l.join()
 
     def process_hotkey(self, k):
-        # 【核心修复】如果焦点在 Entry 中，彻底屏蔽所有按键，防止误触
-        if isinstance(self.focus_get(), tk.Entry): return
+        # 【核心优化】智能焦点判断
+        is_entry_focused = isinstance(self.focus_get(), tk.Entry)
+        is_func_key = len(k) > 1 or k.startswith('f')
 
-        # 获取当前设置的键位
+        # 如果是输入框聚焦 且 不是功能键，则忽略（防止打字时触发）
+        if is_entry_focused and not is_func_key:
+            return
+
         hk = {
             "cap": self.e_cap.get().lower().strip(),
             "pick": self.e_pick.get().lower().strip(),
@@ -368,18 +379,12 @@ class AutoBotGraph(tk.Tk):
                 self.toggle_pause()
             return
 
-            # 2. 录制态
+        # 2. 录制态
         if self.is_recording:
             if k == hk["rec_stop"]:
                 self.flash_status(f"结束录制: {k}")
                 self.stop_record()
-            # 录制时忽略其他功能键
-            elif k in [hk["rec_start"], hk["run_start"], hk["run_stop"], hk["pause"]]:
-                pass
-            else:
-                self.rec_gap()
-                d = {"type": "press", "key": k}
-                self._create_and_link_node(d, from_recording=True)
+            # 录制模式下普通按键由专用监听器处理
             return
 
         # 3. 闲置态
@@ -396,28 +401,51 @@ class AutoBotGraph(tk.Tk):
             self.flash_status(f"开始运行: {k}")
             self.toggle_run()
 
+    # ==========================================
+    # 状态栏逻辑修复
+    # ==========================================
+    def update_status_display(self):
+        """单一事实来源：根据当前内部状态刷新右上角状态显示"""
+        # 1. 录制中优先级最高
+        if self.is_recording:
+            self.lbl_status.config(text="🔴 录制中...", fg="#ff5252")
+            return
+
+        # 2. 运行中优先级其次
+        if self.is_playing:
+            if self.is_paused:
+                self.lbl_status.config(text="⏸ 已暂停", fg="orange")
+            else:
+                self.lbl_status.config(text="▶ 运行中...", fg="#00e676")
+            return
+
+        # 3. 闲置状态，检查逻辑连通性
+        start_node = self.nodes.get(self.start_node_id)
+        # 检查 start 是否连接了下一个有效节点
+        if start_node and start_node.get('next') and start_node['next'] in self.nodes:
+            self.lbl_status.config(text="● 就绪 (已连接)", fg="#00e676")
+        else:
+            self.lbl_status.config(text="○ 就绪 (未连接)", fg="gray")
+
     def flash_status(self, msg):
-        """按键反馈"""
-        old_bg = self.lbl_status.cget("bg")
-        old_fg = self.lbl_status.cget("fg")
-        old_text = self.lbl_status.cget("text")
+        """按键反馈：显示临时信息，然后恢复正确状态"""
         self.lbl_status.config(text=msg, fg="#00e676")
-        self.after(800, lambda: self.lbl_status.config(text=old_text, fg=old_fg))
+        # 800ms 后，不要盲目恢复旧文本，而是重新计算应该显示什么
+        # 这样即使在录制过程中触发了 flash，也能恢复回 "录制中"
+        self.after(800, self.update_status_display)
 
     # ==================================================
     # 逻辑控制
     # ==================================================
     def toggle_pause(self):
         self.is_paused = not self.is_paused
-        if self.is_paused:
-            self.lbl_status.config(text="⏸ 已暂停", fg="orange")
-        else:
-            self.lbl_status.config(text="▶ 运行中...", fg="#00e676")
+        self.update_status_display()  # 使用统一刷新
 
     def stop_playback(self):
         self.is_playing = False
         self.is_paused = False
         self.btn_run.config(text="停止中...", bg="#ff9800")
+        self.update_status_display()  # 使用统一刷新
 
     def toggle_run(self):
         if self.is_playing:
@@ -426,21 +454,43 @@ class AutoBotGraph(tk.Tk):
             self.is_playing = True
             self.is_paused = False
             self.btn_run.config(text="⏹ 停止运行", bg="#ff5252")
+            self.update_status_display()  # 使用统一刷新
             threading.Thread(target=self.run_logic, daemon=True).start()
 
     def _bind_mousewheel(self, event):
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind_all("<Button-4>", self._on_mousewheel)
         self.canvas.bind_all("<Button-5>", self._on_mousewheel)
+        self.canvas.bind_all("<Control-MouseWheel>", self._on_zoom)
+        self.canvas.bind_all("<Control-Button-4>", self._on_zoom)
+        self.canvas.bind_all("<Control-Button-5>", self._on_zoom)
 
     def _unbind_mousewheel(self, event):
         self.canvas.unbind_all("<MouseWheel>")
         self.canvas.unbind_all("<Button-4>")
         self.canvas.unbind_all("<Button-5>")
+        self.canvas.unbind_all("<Control-MouseWheel>")
+        self.canvas.unbind_all("<Control-Button-4>")
+        self.canvas.unbind_all("<Control-Button-5>")
 
     def _on_mousewheel(self, event):
         if event.num == 5 or event.delta == -120: self.canvas.yview_scroll(1, "units")
         if event.num == 4 or event.delta == 120: self.canvas.yview_scroll(-1, "units")
+
+    def _on_zoom(self, event):
+        delta = 0
+        if event.num == 5 or event.delta == -120:
+            delta = -1
+        elif event.num == 4 or event.delta == 120:
+            delta = 1
+
+        if delta > 0:
+            self.zoom_scale *= 1.1
+        else:
+            self.zoom_scale *= 0.9
+
+        self.zoom_scale = max(0.4, min(self.zoom_scale, 2.5))
+        self.refresh_canvas()
 
     def toggle_region_ui(self):
         if self.var_regional.get():
@@ -493,7 +543,9 @@ class AutoBotGraph(tk.Tk):
             self.lbl_p.config(text="秒数:")
 
     def draw_grid(self, max_w, max_h):
-        grid_size = 40
+        grid_size = int(40 * self.zoom_scale)
+        if grid_size < 10: grid_size = 10
+
         for i in range(0, max_w + 100, grid_size):
             color = "#2b2b2b" if i % (grid_size * 5) != 0 else "#3a3a3a"
             self.canvas.create_line([(i, 0), (i, max_h + 100)], fill=color, tags="grid")
@@ -503,7 +555,9 @@ class AutoBotGraph(tk.Tk):
 
     def draw_bezier(self, x1, y1, x2, y2, color="#a9b7c6", width=2):
         dist = abs(x2 - x1) * 0.5
-        if dist < 50: dist = 50
+        min_dist = 50 * self.zoom_scale
+        if dist < min_dist: dist = min_dist
+
         cx1, cy1 = x1 + dist, y1
         cx2, cy2 = x2 - dist, y2
         self.canvas.create_line(x1, y1, cx1, cy1, cx2, cy2, x2, y2, smooth=True, arrow=tk.LAST, width=width, fill=color,
@@ -511,32 +565,43 @@ class AutoBotGraph(tk.Tk):
 
     def refresh_canvas(self):
         self.canvas.delete("all")
-        bbox = self.canvas.bbox("drag_body")
-        if not bbox:
-            max_w, max_h = 1500, 1000
-        else:
-            max_w_node = 0
-            max_h_node = 0
-            for nid, node in self.nodes.items():
-                if node['x'] > max_w_node: max_w_node = node['x']
-                if node['y'] > max_h_node: max_h_node = node['y']
-            max_w = max(1200, max_w_node + 500)
-            max_h = max(800, max_h_node + 500)
+
+        def s(val):
+            return int(val * self.zoom_scale)
+
+        max_w_node = 0
+        max_h_node = 0
+        for nid, node in self.nodes.items():
+            if node['x'] > max_w_node: max_w_node = node['x']
+            if node['y'] > max_h_node: max_h_node = node['y']
+
+        max_w = max(1500, s(max_w_node + 500))
+        max_h = max(1000, s(max_h_node + 500))
+
         self.draw_grid(int(max_w), int(max_h))
         self.canvas.config(scrollregion=(0, 0, max_w, max_h))
+
         for nid, node in self.nodes.items():
             if node.get('next'):
                 next_node = self.nodes.get(node['next'])
                 if next_node:
-                    x1, y1 = node['x'] + 150, node['y'] + 30
-                    x2, y2 = next_node['x'], next_node['y'] + 30
+                    x1, y1 = s(node['x'] + 150), s(node['y'] + 30)
+                    x2, y2 = s(next_node['x']), s(next_node['y'] + 30)
+
                     color = THEME["wire_active"] if nid == self.selected_node_id else THEME["wire"]
                     width = 3 if nid == self.selected_node_id else 2
                     self.draw_bezier(x1, y1, x2, y2, color, width)
+
+        base_w, base_h = 150, 60
+        w, h = s(base_w), s(base_h)
+
+        font_title_size = max(6, s(9))
+        font_detail_size = max(5, s(8))
+
         for nid, node in self.nodes.items():
-            x, y = node['x'], node['y']
-            w, h = 150, 60
+            x, y = s(node['x']), s(node['y'])
             t = node['type']
+
             header_color = THEME["header_default"]
             if t == 'start':
                 header_color = THEME["header_start"]
@@ -546,16 +611,21 @@ class AutoBotGraph(tk.Tk):
                 header_color = THEME["header_click"]
             elif t in ['text', 'press']:
                 header_color = THEME["header_input"]
+
             outline = "#ffffff" if nid == self.selected_node_id else THEME["node_border"]
             tag = f"node_{nid}"
-            self.canvas.create_rectangle(x + 4, y + 4, x + w + 4, y + h + 4, fill="#111111", outline="", tags="grid")
+
+            self.canvas.create_rectangle(x + s(4), y + s(4), x + w + s(4), y + h + s(4), fill="#111111", outline="",
+                                         tags="grid")
             self.canvas.create_rectangle(x, y, x + w, y + h, fill=THEME["node_bg"], outline=outline, width=1,
                                          tags=(tag, "drag_body"))
-            self.canvas.create_rectangle(x + 1, y + 1, x + 6, y + h - 1, fill=header_color, outline="",
+            self.canvas.create_rectangle(x + s(1), y + s(1), x + s(6), y + h - s(1), fill=header_color, outline="",
                                          tags=(tag, "drag_body"))
+
             title = t.upper().replace("_", " ")
-            self.canvas.create_text(x + 15, y + 20, text=title, anchor="w", fill="white", font=("Segoe UI", 9, "bold"),
-                                    tags=(tag, "drag_body"))
+            self.canvas.create_text(x + s(15), y + s(20), text=title, anchor="w", fill="white",
+                                    font=("Segoe UI", font_title_size, "bold"), tags=(tag, "drag_body"))
+
             detail = ""
             if t == 'find_img':
                 detail = f"[{os.path.basename(node['data'].get('img', ''))[:15]}]"
@@ -563,17 +633,27 @@ class AutoBotGraph(tk.Tk):
                 detail = f"({node['data'].get('x')}, {node['data'].get('y')})"
             elif t == 'wait':
                 detail = f"{node['data'].get('time')}s"
-            self.canvas.create_text(x + 15, y + 40, text=detail, anchor="w", fill="#999", font=("Consolas", 8),
-                                    tags=(tag, "drag_body"))
-            if t != 'start': self.canvas.create_oval(x - 5, y + 25, x + 5, y + 35, fill="#ff5252",
-                                                     outline=THEME["bg_canvas"], width=2, tags=(f"in_{nid}", "port_in"))
-            self.canvas.create_oval(x + w - 5, y + 25, x + w + 5, y + 35, fill="#00e676", outline=THEME["bg_canvas"],
-                                    width=2, tags=(f"out_{nid}", "port_out"))
+
+            self.canvas.create_text(x + s(15), y + s(40), text=detail, anchor="w", fill="#999",
+                                    font=("Consolas", font_detail_size), tags=(tag, "drag_body"))
+
+            port_r = s(5)
+            if t != 'start':
+                self.canvas.create_oval(x - port_r, y + s(25), x + port_r, y + s(35), fill="#ff5252",
+                                        outline=THEME["bg_canvas"], width=2, tags=(f"in_{nid}", "port_in"))
+            self.canvas.create_oval(x + w - port_r, y + s(25), x + w + port_r, y + s(35), fill="#00e676",
+                                    outline=THEME["bg_canvas"], width=2, tags=(f"out_{nid}", "port_out"))
+
+        # 【核心修复】在每次重绘（包括连线改变、拖拽）后，强制刷新右上角状态
+        # 这样能保证就连线状态（就绪/未就绪）和录制状态都不被覆盖
+        self.update_status_display()
 
     def on_canvas_press(self, event):
         wx = self.canvas.canvasx(event.x)
         wy = self.canvas.canvasy(event.y)
-        items = self.canvas.find_overlapping(wx - 5, wy - 5, wx + 5, wy + 5)
+        fuzz = 5 * self.zoom_scale
+        items = self.canvas.find_overlapping(wx - fuzz, wy - fuzz, wx + fuzz, wy + fuzz)
+
         for item in items:
             tags = self.canvas.gettags(item)
             if "port_out" in tags:
@@ -605,15 +685,19 @@ class AutoBotGraph(tk.Tk):
     def on_canvas_drag(self, event):
         wx = self.canvas.canvasx(event.x)
         wy = self.canvas.canvasy(event.y)
+
         if self.drag_data["type"] == "move":
             dx = wx - self.drag_data["x"]
             dy = wy - self.drag_data["y"]
             nid = self.drag_data["source_id"]
-            self.nodes[nid]['x'] += dx
-            self.nodes[nid]['y'] += dy
+
+            self.nodes[nid]['x'] += dx / self.zoom_scale
+            self.nodes[nid]['y'] += dy / self.zoom_scale
+
             self.drag_data["x"] = wx
             self.drag_data["y"] = wy
             self.refresh_canvas()
+
         elif self.drag_data["type"] == "wire":
             if self.temp_line: self.canvas.delete(self.temp_line)
             self.temp_line = self.canvas.create_line(self.drag_data["x"], self.drag_data["y"], wx, wy, fill="white",
@@ -624,7 +708,10 @@ class AutoBotGraph(tk.Tk):
         wy = self.canvas.canvasy(event.y)
         if self.drag_data["type"] == "wire":
             if self.temp_line: self.canvas.delete(self.temp_line); self.temp_line = None
-            items = self.canvas.find_overlapping(wx - 10, wy - 10, wx + 10, wy + 10)
+
+            fuzz = 10 * self.zoom_scale
+            items = self.canvas.find_overlapping(wx - fuzz, wy - fuzz, wx + fuzz, wy + fuzz)
+
             connected = False
             for item in items:
                 tags = self.canvas.gettags(item)
@@ -651,14 +738,7 @@ class AutoBotGraph(tk.Tk):
 
             if "寻找图片" in t:
                 if not self.current_img_path or not os.path.exists(self.current_img_path):
-                    # 如果只是更新参数（比如超时时间），允许不重新截图，直接使用已有的
-                    # 但如果是全新增，必须检查。这里为了简单，如果有旧图且文件存在，也允许
                     pass
-
-                    # 注意：如果用户清空了 current_img_path，这里会报错。
-                # 在更新逻辑中，我们通常假设 UI 上的数据是准的。
-                # 可以在这里做一个小的容错：如果是 Update 操作且 UI 没有新图，保持旧图？
-                # 但 get_ui_data 是纯粹从 UI 获取数据的。
 
                 if not self.current_img_path or not os.path.exists(self.current_img_path):
                     messagebox.showerror("错误", "请先截图！\n(按 F7 或点击截图按钮)")
@@ -693,9 +773,6 @@ class AutoBotGraph(tk.Tk):
         if not data: return
         self._create_and_link_node(data)
 
-    # ==================================================
-    # 【新增】更新节点功能
-    # ==================================================
     def update_node_btn(self):
         """更新当前选中节点的参数"""
         if not self.selected_node_id:
@@ -709,13 +786,11 @@ class AutoBotGraph(tk.Tk):
         data = self.get_ui_data()
         if not data: return
 
-        # 更新数据
         self.nodes[self.selected_node_id]['type'] = data['type']
         self.nodes[self.selected_node_id]['data'] = data
 
         self.refresh_canvas()
         self.flash_status(f"✅ 节点 {self.selected_node_id} 已更新")
-        # 重新加载回 UI 确认
         self.load_node_to_ui(self.selected_node_id)
 
     def _create_and_link_node(self, data, from_recording=False):
@@ -808,9 +883,15 @@ class AutoBotGraph(tk.Tk):
             self.recording_last_id = self.start_node_id
         else:
             self.recording_last_id = self.selected_node_id
+
+        # 初始化录制状态
         self.is_recording = True
         self.last_action_time = time.time()
-        self.lbl_status.config(text="🔴 录制中...", fg="#ff5252")
+        self.rec_start_pos = None  # 重置拖拽起点
+
+        # 这里不手动 config，而是调用一次 update
+        self.update_status_display()
+
         self.mouse_listener = mouse.Listener(on_click=self.on_rec_click)
         self.key_listener = keyboard.Listener(on_press=self.on_rec_key)
         self.mouse_listener.start()
@@ -820,7 +901,7 @@ class AutoBotGraph(tk.Tk):
         self.is_recording = False
         if self.mouse_listener: self.mouse_listener.stop()
         if self.key_listener: self.key_listener.stop()
-        self.lbl_status.config(text="✅ 完成", fg="#00e676")
+        self.update_status_display()  # 刷新回就绪
         self.auto_layout()
 
     def rec_gap(self):
@@ -831,11 +912,47 @@ class AutoBotGraph(tk.Tk):
             self.after(0, lambda: self._create_and_link_node(d, from_recording=True))
 
     def on_rec_click(self, x, y, button, pressed):
-        if not pressed or not self.is_recording: return
-        self.rec_gap()
-        btn = "left" if button == mouse.Button.left else "right"
-        d = {"type": "click", "x": x, "y": y, "btn": btn}
-        self.after(0, lambda: self._create_and_link_node(d, from_recording=True))
+        if not self.is_recording: return
+
+        now = time.time()
+
+        if pressed:
+            # 鼠标按下：记录起点和时间
+            self.rec_start_pos = (x, y)
+            self.rec_start_time = now
+
+            # 计算并记录此前的等待时间 (Gap)
+            gap = now - self.last_action_time
+            if gap > 0.05:
+                d = {"type": "wait", "time": round(gap, 3)}
+                self.after(0, lambda: self._create_and_link_node(d, from_recording=True))
+
+        else:
+            # 鼠标松开：判断是点击还是拖拽
+            if self.rec_start_pos is None: return
+
+            start_x, start_y = self.rec_start_pos
+            # 更新最后动作时间为松开的时间
+            self.last_action_time = now
+
+            # 计算位移和持续时间
+            dist = ((x - start_x) ** 2 + (y - start_y) ** 2) ** 0.5
+            dur = now - self.rec_start_time
+
+            if dist > 20:
+                # 认为是拖拽：先生成移动到起点的动作，再生成拖拽到终点的动作
+                d_move = {"type": "move", "x": start_x, "y": start_y}
+                self.after(0, lambda: self._create_and_link_node(d_move, from_recording=True))
+
+                d_drag = {"type": "drag", "x": x, "y": y, "dur": round(dur, 2)}
+                self.after(0, lambda: self._create_and_link_node(d_drag, from_recording=True))
+            else:
+                # 认为是点击
+                btn = "left" if button == mouse.Button.left else "right"
+                d = {"type": "click", "x": start_x, "y": start_y, "btn": btn}
+                self.after(0, lambda: self._create_and_link_node(d, from_recording=True))
+
+            self.rec_start_pos = None
 
     def on_rec_key(self, key):
         if not self.is_recording: return
@@ -911,7 +1028,11 @@ class AutoBotGraph(tk.Tk):
 
     def capture_done(self, bbox):
         self.state('normal')
-        self.focus_set()
+
+        # 【核心修复】截图完成后，强力聚焦主窗口
+        # 使用 after 稍微延时，确保系统窗口切换完毕后再抢占焦点
+        self.after(100, self.focus_force)
+
         if not bbox: return
         ts = int(time.time() * 1000)
         path = f"assets/img_{ts}.png"
@@ -972,13 +1093,21 @@ class AutoBotGraph(tk.Tk):
                     node = self.nodes.get(curr_id)
                     if not node: break
                     self.selected_node_id = curr_id
-                    self.refresh_canvas()
+                    # 在主线程更新UI
+                    self.after(0, self.refresh_canvas)
+
                     if node['type'] != 'start':
                         d = node['data']
                         if d['type'] == 'wait':
                             time.sleep(d['time'])
                         elif d['type'] == 'click':
                             pyautogui.click(d['x'], d['y'])
+                        elif d['type'] == 'move':
+                            # 【新增】支持移动
+                            pyautogui.moveTo(d['x'], d['y'], duration=0.2)
+                        elif d['type'] == 'drag':
+                            # 【新增】支持拖拽，默认按左键
+                            pyautogui.dragTo(d['x'], d['y'], duration=d.get('dur', 0.5), button='left')
                         elif d['type'] == 'text':
                             pyautogui.write(d['text'])
                         elif d['type'] == 'press':
@@ -995,7 +1124,7 @@ class AutoBotGraph(tk.Tk):
         finally:
             self.is_playing = False
             self.btn_run.config(text="▶ 开始运行", bg="#00e676")
-            self.lbl_status.config(text="● 就绪", fg="#bbbbbb")
+            self.update_status_display()
 
 
 if __name__ == "__main__":
